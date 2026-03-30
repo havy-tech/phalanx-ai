@@ -13,6 +13,8 @@ use Phalanx\Stream\Emitter;
 use React\Http\Browser;
 use React\Stream\ReadableStreamInterface;
 
+use React\Promise\Deferred;
+
 use function React\Async\await;
 
 final class AnthropicProvider implements LlmProvider
@@ -24,25 +26,50 @@ final class AnthropicProvider implements LlmProvider
     ) {
         $this->browser = new Browser()
             ->withTimeout(120.0)
-            ->withFollowRedirects(false);
+            ->withFollowRedirects(false)
+            ->withRejectErrorResponse(false);
     }
 
     public function generate(GenerateRequest $request): Emitter
     {
-        return Emitter::produce(function ($channel, $ctx) use ($request) {
-            $model = $request->model ?? $this->config->model;
-            $body = self::buildRequestBody($request, $model, $this->config);
-            $headers = self::buildHeaders($this->config);
+        $config = $this->config;
+        $browser = $this->browser;
+
+        return Emitter::produce(static function ($channel, $ctx) use ($request, $config, $browser) {
+            $model = $request->model ?? $config->model;
+            $body = self::buildRequestBody($request, $model, $config);
+            $headers = self::buildHeaders($config);
             $startTime = hrtime(true);
             $step = 0;
             $usage = TokenUsage::zero();
 
-            $response = await($this->browser->requestStreaming(
+            $jsonBody = json_encode($body, JSON_THROW_ON_ERROR);
+
+            $response = await($browser->requestStreaming(
                 'POST',
-                $this->config->baseUrl . '/v1/messages',
+                $config->baseUrl . '/v1/messages',
                 $headers,
-                json_encode($body, JSON_THROW_ON_ERROR),
+                $jsonBody,
             ));
+
+            $statusCode = $response->getStatusCode();
+            if ($statusCode >= 400) {
+                $errStream = $response->getBody();
+                $errBuf = '';
+                if ($errStream instanceof ReadableStreamInterface) {
+                    $errDone = new Deferred();
+                    $errStream->on('data', static function (string $d) use (&$errBuf): void { $errBuf .= $d; });
+                    $errStream->on('end', static function () use ($errDone): void { $errDone->resolve(null); });
+                    $errStream->on('error', static function () use ($errDone): void { $errDone->resolve(null); });
+                    await($errDone->promise());
+                }
+                @file_put_contents(
+                    '/tmp/sentinel-api-debug.log',
+                    '[' . date('H:i:s') . "] HTTP {$statusCode}\nREQUEST: {$jsonBody}\nRESPONSE: {$errBuf}\n\n",
+                    FILE_APPEND,
+                );
+                throw new \RuntimeException("Anthropic API {$statusCode}: {$errBuf}");
+            }
 
             /** @var ReadableStreamInterface $body */
             $body = $response->getBody();
@@ -187,17 +214,33 @@ final class AnthropicProvider implements LlmProvider
     {
         $buffer = '';
         $ended = false;
+        $waiting = null;
 
-        $body->on('data', static function (string $data) use (&$buffer): void {
+        $body->on('data', static function (string $data) use (&$buffer, &$waiting): void {
             $buffer .= $data;
+            if ($waiting !== null) {
+                $d = $waiting;
+                $waiting = null;
+                $d->resolve(true);
+            }
         });
 
-        $body->on('end', static function () use (&$ended): void {
+        $body->on('end', static function () use (&$ended, &$waiting): void {
             $ended = true;
+            if ($waiting !== null) {
+                $d = $waiting;
+                $waiting = null;
+                $d->resolve(false);
+            }
         });
 
-        $body->on('error', static function () use (&$ended): void {
+        $body->on('error', static function () use (&$ended, &$waiting): void {
             $ended = true;
+            if ($waiting !== null) {
+                $d = $waiting;
+                $waiting = null;
+                $d->resolve(false);
+            }
         });
 
         while (!$ended || $buffer !== '') {
@@ -206,8 +249,8 @@ final class AnthropicProvider implements LlmProvider
                 $buffer = '';
                 yield $chunk;
             } else {
-                \React\EventLoop\Loop::futureTick(static fn() => null);
-                \Fiber::suspend();
+                $waiting = new Deferred();
+                await($waiting->promise());
             }
         }
     }
