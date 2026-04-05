@@ -15,7 +15,7 @@ use React\Stream\ReadableStreamInterface;
 
 use React\Promise\Deferred;
 
-use function React\Async\await;
+use Phalanx\Stream\Contract\StreamContext;
 
 final class OpenAiProvider implements LlmProvider
 {
@@ -42,7 +42,7 @@ final class OpenAiProvider implements LlmProvider
             $step = 0;
             $usage = TokenUsage::zero();
 
-            $response = await($browser->requestStreaming(
+            $response = $ctx->await($browser->requestStreaming(
                 'POST',
                 $config->baseUrl . '/v1/chat/completions',
                 $headers,
@@ -56,7 +56,7 @@ final class OpenAiProvider implements LlmProvider
             $parser = new SseParser();
             $toolCalls = [];
 
-            foreach (self::readChunks($body) as $chunk) {
+            foreach (self::readChunks($body, $ctx) as $chunk) {
                 $ctx->throwIfCancelled();
 
                 foreach ($parser->feed($chunk) as $sseEvent) {
@@ -174,13 +174,17 @@ final class OpenAiProvider implements LlmProvider
     }
 
     /** @return \Generator<int, string, mixed, void> */
-    private static function readChunks(ReadableStreamInterface $body): \Generator
+    private static function readChunks(ReadableStreamInterface $body, StreamContext $ctx): \Generator
     {
         $buffer = '';
         $ended = false;
         $waiting = null;
+        $abandoned = false;
 
-        $body->on('data', static function (string $data) use (&$buffer, &$waiting): void {
+        $body->on('data', static function (string $data) use (&$buffer, &$waiting, &$abandoned): void {
+            if ($abandoned) {
+                return;
+            }
             $buffer .= $data;
             if ($waiting !== null) {
                 $d = $waiting;
@@ -189,7 +193,10 @@ final class OpenAiProvider implements LlmProvider
             }
         });
 
-        $body->on('end', static function () use (&$ended, &$waiting): void {
+        $body->on('end', static function () use (&$ended, &$waiting, &$abandoned): void {
+            if ($abandoned) {
+                return;
+            }
             $ended = true;
             if ($waiting !== null) {
                 $d = $waiting;
@@ -198,7 +205,10 @@ final class OpenAiProvider implements LlmProvider
             }
         });
 
-        $body->on('error', static function () use (&$ended, &$waiting): void {
+        $body->on('error', static function () use (&$ended, &$waiting, &$abandoned): void {
+            if ($abandoned) {
+                return;
+            }
             $ended = true;
             if ($waiting !== null) {
                 $d = $waiting;
@@ -207,15 +217,20 @@ final class OpenAiProvider implements LlmProvider
             }
         });
 
-        while (!$ended || $buffer !== '') {
-            if ($buffer !== '') {
-                $chunk = $buffer;
-                $buffer = '';
-                yield $chunk;
-            } else {
-                $waiting = new Deferred();
-                await($waiting->promise());
+        try {
+            while (!$ended || $buffer !== '') {
+                if ($buffer !== '') {
+                    $chunk = $buffer;
+                    $buffer = '';
+                    yield $chunk;
+                } else {
+                    $waiting = new Deferred();
+                    $ctx->await($waiting->promise());
+                }
             }
+        } finally {
+            $abandoned = true;
+            $waiting = null;
         }
     }
 }
